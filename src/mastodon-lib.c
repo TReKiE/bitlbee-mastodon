@@ -1339,6 +1339,48 @@ static void mastodon_stream_handle_event(struct im_connection *ic, mastodon_evt_
 /**
  * When streaming, we also want to tag the events appropriately. This only affects updates, for now.
  */
+static void mastodon_http_stream_user(struct http_request *req);
+void mastodon_stream(struct im_connection *ic, struct http_request *req);
+
+static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
+{
+	struct im_connection *ic = req->data;
+	struct mastodon_data *md = ic->proto_data;
+	char *location = NULL;
+	url_t url;
+	struct http_request *redirected_req;
+
+	if (req->status_code != 301 && req->status_code != 302 &&
+	    req->status_code != 307 && req->status_code != 308) {
+		return FALSE;
+	}
+
+	location = get_rfc822_header(req->reply_headers, "Location", 0);
+	if (!location || !url_set(&url, location) || url.proto != PROTO_HTTPS) {
+		imcb_error(ic, "Refusing invalid or non-HTTPS streaming redirect%s%s",
+		           location ? ": " : "", location ? location : "");
+		g_free(location);
+		return FALSE;
+	}
+
+	if (++md->stream_redirect_count > 5) {
+		imcb_error(ic, "Too many redirects while opening the user stream");
+		g_free(location);
+		return FALSE;
+	}
+
+	/* The old request is already finishing. Replace it in the stream list
+	 * before opening the redirected request. mastodon_http() accepts an
+	 * absolute URL and preserves the Authorization header. */
+	md->streams = g_slist_remove(md->streams, req);
+	mastodon_log(ic, "Following user streaming redirect to %s", location);
+	redirected_req = mastodon_http(ic, location, mastodon_http_stream_user,
+	                               ic, HTTP_GET, NULL, 0);
+	g_free(location);
+	mastodon_stream(ic, redirected_req);
+	return redirected_req != NULL;
+}
+
 static void mastodon_http_stream(struct http_request *req, mastodon_timeline_type_t subscription)
 {
 	struct im_connection *ic = req->data;
@@ -1348,6 +1390,14 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 
 	if (!g_slist_find(mastodon_connections, ic)) {
 		return;
+	}
+
+	/* Mastodon may move the user stream to a dedicated streaming host. */
+	if (subscription == MT_HOME && mastodon_stream_follow_user_redirect(req)) {
+		return;
+	}
+	if (req->status_code == 200) {
+		md->stream_redirect_count = 0;
 	}
 
 	if ((req->flags & HTTPC_EOF) || !req->reply_body) {
