@@ -1401,10 +1401,16 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 	}
 
 	mastodon_log(ic,
-             "Stream callback: status=%d flags=0x%x body=%s",
-             req->status_code,
-             req->flags,
-             req->reply_body ? "present" : "null");
+				"Stream callback: status=%d flags=0x%x body=%s",
+				req->status_code,
+				req->flags,
+				req->reply_body ? "present" : "null");
+
+	if ((req->flags & HTTPC_EOF) && req->reply_body) {
+		mastodon_log(ic,
+					"Final stream response body: %.500s",
+					req->reply_body);
+	}
 
 	if (req->flags & HTTPC_EOF) {
  		md->streams = g_slist_remove (md->streams, req);
