@@ -34,5 +34,6 @@ typedef enum {
 	HTTP_DELETE,
 } http_method_t;
 
-struct http_request *mastodon_http(struct im_connection *ic, char *url_string, http_input_function func,
-                                  gpointer data, http_method_t method, char** arguments, int arguments_len);
+struct http_request *mastodon_http_stream_request(struct im_connection *ic, char *url_string,
+                                                  http_input_function func, gpointer data,
+                                                  char **arguments, int arguments_len);

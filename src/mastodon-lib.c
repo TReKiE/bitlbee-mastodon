@@ -1374,8 +1374,8 @@ static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
 	 * absolute URL and preserves the Authorization header. */
 	md->streams = g_slist_remove(md->streams, req);
 	mastodon_log(ic, "Following user streaming redirect to %s", location);
-	redirected_req = mastodon_http(ic, location, mastodon_http_stream_user,
-	                               ic, HTTP_GET, NULL, 0);
+	redirected_req = mastodon_http_stream_request(ic, location, mastodon_http_stream_user,
+	                                              ic, NULL, 0);
 	g_free(location);
 	mastodon_stream(ic, redirected_req);
 	return redirected_req != NULL;
@@ -1521,8 +1521,8 @@ void mastodon_stream(struct im_connection *ic, struct http_request *req)
  */
 void mastodon_open_user_stream(struct im_connection *ic)
 {
-	struct http_request *req = mastodon_http(ic, MASTODON_STREAMING_USER_URL,
-						 mastodon_http_stream_user, ic, HTTP_GET, NULL, 0);
+	struct http_request *req = mastodon_http_stream_request(ic, MASTODON_STREAMING_USER_URL,
+						                mastodon_http_stream_user, ic, NULL, 0);
 	mastodon_stream(ic, req);
 }
 
@@ -1535,8 +1535,8 @@ struct http_request *mastodon_open_hashtag_stream(struct im_connection *ic, char
 		"tag", hashtag,
 	};
 
-	struct http_request *req = mastodon_http(ic, MASTODON_STREAMING_HASHTAG_URL,
-						 mastodon_http_stream_hashtag, ic, HTTP_GET, args, 2);
+	struct http_request *req = mastodon_http_stream_request(ic, MASTODON_STREAMING_HASHTAG_URL,
+						                mastodon_http_stream_hashtag, ic, args, 2);
 	mastodon_stream(ic, req);
 	return req;
 }
@@ -1549,8 +1549,8 @@ void mastodon_list_stream(struct im_connection *ic, struct mastodon_command *mc)
 		"list", g_strdup_printf("%" G_GINT64_FORMAT, mc->id),
 	};
 
-	struct http_request *req = mastodon_http(ic, MASTODON_STREAMING_LIST_URL,
-						 mastodon_http_stream_list, ic, HTTP_GET, args, 2);
+	struct http_request *req = mastodon_http_stream_request(ic, MASTODON_STREAMING_LIST_URL,
+						                mastodon_http_stream_list, ic, args, 2);
 	mastodon_stream(ic, req);
 	/* We cannot return req here because this is a callback (as we had to figure out the list id before getting here).
 	 * This is why we must rely on the groupchat being part of mastodon_command (mc). */
@@ -1581,8 +1581,8 @@ void mastodon_open_unknown_list_stream(struct im_connection *ic, struct groupcha
  */
 struct http_request *mastodon_open_local_stream(struct im_connection *ic)
 {
-	struct http_request *req = mastodon_http(ic, MASTODON_STREAMING_LOCAL_URL,
-						 mastodon_http_stream_local, ic, HTTP_GET, NULL, 0);
+	struct http_request *req = mastodon_http_stream_request(ic, MASTODON_STREAMING_LOCAL_URL,
+						                mastodon_http_stream_local, ic, NULL, 0);
 	mastodon_stream(ic, req);
 	return req;
 }
@@ -1592,8 +1592,8 @@ struct http_request *mastodon_open_local_stream(struct im_connection *ic)
  */
 struct http_request *mastodon_open_federated_stream(struct im_connection *ic)
 {
-	struct http_request *req = mastodon_http(ic, MASTODON_STREAMING_FEDERATED_URL,
-						 mastodon_http_stream_federated, ic, HTTP_GET, NULL, 0);
+	struct http_request *req = mastodon_http_stream_request(ic, MASTODON_STREAMING_FEDERATED_URL,
+						                mastodon_http_stream_federated, ic, NULL, 0);
 	mastodon_stream(ic, req);
 	return req;
 }

@@ -66,8 +66,9 @@ static char *mastodon_url_append(char *url, char *key, char *value)
  * Do a request.
  * This is actually pretty generic function... Perhaps it should move to the lib/http_client.c
  */
-struct http_request *mastodon_http(struct im_connection *ic, char *url_string, http_input_function func,
-                                  gpointer data, http_method_t method, char **arguments, int arguments_len)
+static struct http_request *mastodon_http_request(struct im_connection *ic, char *url_string,
+                                                  http_input_function func, gpointer data, http_method_t method,
+                                                  char **arguments, int arguments_len, gboolean streaming)
 {
 	struct mastodon_data *md = ic->proto_data;
 	void *ret = NULL;
@@ -120,6 +121,11 @@ struct http_request *mastodon_http(struct im_connection *ic, char *url_string, h
 			method == HTTP_GET && url_arguments[0] ? url_arguments : "",
 	                base_url ? base_url->host : md->url_host,
 			md->oauth2_access_token);
+	
+	if (streaming) {
+		g_string_append(request, "Accept: text/event-stream\r\n"
+		                         "Cache-Control: no-cache\r\n");
+	}
 
 	// Do POST stuff..
 	if (method != HTTP_GET) {
@@ -145,4 +151,19 @@ error:
 	g_free(url_arguments);
 	g_free(base_url);
 	return ret;
+}
+
+
+struct http_request *mastodon_http(struct im_connection *ic, char *url_string, http_input_function func,
+                                  gpointer data, http_method_t method, char **arguments, int arguments_len)
+{
+	return mastodon_http_request(ic, url_string, func, data, method,
+	                             arguments, arguments_len, FALSE);
+}
+
+struct http_request *mastodon_http_stream_request(struct im_connection *ic, char *url_string,
+                                                  http_input_function func, gpointer data,
+                                                  char **arguments, int arguments_len)
+{
+	return mastodon_http_request(ic, url_string, func, data, HTTP_GET, arguments, arguments_len, TRUE);
 }
