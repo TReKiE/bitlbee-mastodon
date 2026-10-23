@@ -1400,10 +1400,26 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 		md->stream_redirect_count = 0;
 	}
 
-	if ((req->flags & HTTPC_EOF) || !req->reply_body) {
-		md->streams = g_slist_remove (md->streams, req);
-		imcb_error(ic, "Stream closed (%s)", req->status_string);
-		imc_logout(ic, TRUE);
+	mastodon_log(ic,
+             "Stream callback: status=%d flags=0x%x body=%s",
+             req->status_code,
+             req->flags,
+             req->reply_body ? "present" : "null");
+
+	if (req->flags & HTTPC_EOF) {
+ 		md->streams = g_slist_remove (md->streams, req);
+ 		imcb_error(ic, "Stream closed (%s)", req->status_string);
+ 		imc_logout(ic, TRUE);
+ 		return;
+ 	}
+ 
+	/*
+	 * An empty streaming callback is not necessarily EOF. In particular,
+	 * the Mastodon streaming server may invoke us while processing an SSE
+	 * heartbeat without providing an event body.
+	 */
+	if (!req->reply_body) {
+		ic->flags |= OPT_PONGED;
 		return;
 	}
 
