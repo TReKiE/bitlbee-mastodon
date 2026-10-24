@@ -135,6 +135,9 @@ struct mastodon_data {
 
 	GSList *streams; /* of struct http_request */
 	int stream_redirect_count; /* redirects followed while opening the user stream */
+	guint user_stream_reconnect_source;
+	guint user_stream_reconnect_delay;
+	gboolean user_stream_received_data;
 	struct groupchat *timeline_gc;
 	guint64 seen_id; /* For deduplication */
 	mastodon_flags_t flags;

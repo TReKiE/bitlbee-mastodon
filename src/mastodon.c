@@ -538,6 +538,11 @@ static void mastodon_logout(struct im_connection *ic)
 			imcb_chat_free(md->timeline_gc);
 		}
 
+		if (md->user_stream_reconnect_source != 0) {
+			b_event_remove(md->user_stream_reconnect_source);
+			md->user_stream_reconnect_source = 0;
+		}
+
 		GSList *l;
 		for (l = md->streams; l; l = l->next) {
 			struct http_request *req = l->data;
