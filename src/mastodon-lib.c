@@ -1375,6 +1375,10 @@ static void mastodon_schedule_user_stream_reconnect(struct im_connection *ic, gb
 		return;
 	}
 
+	/* The account itself is still usable while only the SSE stream is being
+	 * retried. Keep BitlBee's watchdog satisfied during bounded backoff. */
+	ic->flags |= OPT_PONGED;
+
 	if (established) {
 		delay = 1;
 		md->user_stream_reconnect_delay = 0;
@@ -1394,6 +1398,22 @@ static void mastodon_schedule_user_stream_reconnect(struct im_connection *ic, gb
 	//              delay, delay == 1 ? "" : "s");
 	md->user_stream_reconnect_source =
 	        b_timeout_add(delay * 1000, mastodon_reconnect_user_stream, ic);
+}
+
+/* Finish a failed user-stream opening attempt without taking the account
+ * offline. The request callback owns req, so only remove our references to
+ * it and let the HTTP client finish disposing of it. */
+static void mastodon_fail_user_stream_attempt(struct im_connection *ic,
+                                              struct http_request *req)
+{
+	struct mastodon_data *md = ic->proto_data;
+
+	md->streams = g_slist_remove(md->streams, req);
+	if (md->user_stream_request == req) {
+		md->user_stream_request = NULL;
+	}
+	md->user_stream_received_data = FALSE;
+	mastodon_schedule_user_stream_reconnect(ic, FALSE);
 }
 
 static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
@@ -1420,13 +1440,15 @@ static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
 		imcb_error(ic, "Refusing invalid or non-HTTPS streaming redirect%s%s",
 		           location ? ": " : "", location ? location : "");
 		g_free(location);
-		return FALSE;
+		mastodon_fail_user_stream_attempt(ic, req);
+		return TRUE;
 	}
 
 	if (++md->stream_redirect_count > 5) {
 		imcb_error(ic, "Too many redirects while opening the user stream");
 		g_free(location);
-		return FALSE;
+		mastodon_fail_user_stream_attempt(ic, req);
+		return TRUE;
 	}
 
 	/* The old request is already finishing. Replace it in the stream list
@@ -1436,10 +1458,18 @@ static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
 	//mastodon_log(ic, "Following user streaming redirect to %s", location);
 	redirected_req = mastodon_http_stream_request(ic, location, mastodon_http_stream_user,
 	                                              ic, NULL, 0);
-	md->user_stream_request = redirected_req;
 	g_free(location);
+
+	if (!redirected_req) {
+		md->user_stream_request = NULL;
+		md->user_stream_received_data = FALSE;
+		mastodon_schedule_user_stream_reconnect(ic, FALSE);
+		return TRUE;
+	}
+
+	md->user_stream_request = redirected_req;
 	mastodon_stream(ic, redirected_req);
-	return redirected_req != NULL;
+	return TRUE;
 }
 
 static void mastodon_http_stream(struct http_request *req, mastodon_timeline_type_t subscription)
@@ -1616,8 +1646,18 @@ void mastodon_open_user_stream(struct im_connection *ic)
 		return;
 	}
 
+	/* This is a new redirect chain, not a continuation of the previous
+	 * stream connection attempt. */
+	md->stream_redirect_count = 0;
+	md->user_stream_received_data = FALSE;
+
 	req = mastodon_http_stream_request(ic, MASTODON_STREAMING_USER_URL,
 	                                  mastodon_http_stream_user, ic, NULL, 0);
+	if (!req) {
+		mastodon_schedule_user_stream_reconnect(ic, FALSE);
+		return;
+	}
+
 	md->user_stream_request = req;
 	mastodon_stream(ic, req);
 }
