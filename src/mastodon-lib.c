@@ -1361,7 +1361,7 @@ static gboolean mastodon_reconnect_user_stream(gpointer data)
 		return FALSE;
 	}
 
-	mastodon_log(ic, "Reconnecting user stream");
+	//mastodon_log(ic, "Reconnecting user stream");
 	mastodon_open_user_stream(ic);
 	return FALSE;
 }
@@ -1390,8 +1390,8 @@ static void mastodon_schedule_user_stream_reconnect(struct im_connection *ic, gb
 		delay = md->user_stream_reconnect_delay;
 	}
 
-	mastodon_log(ic, "User stream disconnected; reconnecting in %u second%s",
-	             delay, delay == 1 ? "" : "s");
+	// mastodon_log(ic, "User stream disconnected; reconnecting in %u second%s",
+	//              delay, delay == 1 ? "" : "s");
 	md->user_stream_reconnect_source =
 	        b_timeout_add(delay * 1000, mastodon_reconnect_user_stream, ic);
 }
@@ -1433,7 +1433,7 @@ static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
 	 * before opening the redirected request. mastodon_http() accepts an
 	 * absolute URL and preserves the Authorization header. */
 	md->streams = g_slist_remove(md->streams, req);
-	mastodon_log(ic, "Following user streaming redirect to %s", location);
+	//mastodon_log(ic, "Following user streaming redirect to %s", location);
 	redirected_req = mastodon_http_stream_request(ic, location, mastodon_http_stream_user,
 	                                              ic, NULL, 0);
 	md->user_stream_request = redirected_req;
@@ -1481,10 +1481,10 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 		md->streams = g_slist_remove(md->streams, req);
 		if (subscription == MT_HOME) {
 			md->user_stream_request = NULL;
-			mastodon_log(ic, "User stream closed (%s)", req->status_string);
+			//mastodon_log(ic, "User stream closed (%s)", req->status_string);
 			mastodon_schedule_user_stream_reconnect(ic, established);
 		} else {
-			mastodon_log(ic, "Stream closed (%s)", req->status_string);
+			//mastodon_log(ic, "Stream closed (%s)", req->status_string);
 		}
 		return;
 	}
