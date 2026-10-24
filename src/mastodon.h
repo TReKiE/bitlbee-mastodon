@@ -134,6 +134,7 @@ struct mastodon_data {
 	gpointer context_after_obj; /* of mastodon_list */
 
 	GSList *streams; /* of struct http_request */
+	struct http_request *user_stream_request; /* the one user stream allowed to reconnect */
 	int stream_redirect_count; /* redirects followed while opening the user stream */
 	guint user_stream_reconnect_source;
 	guint user_stream_reconnect_delay;

@@ -1355,6 +1355,12 @@ static gboolean mastodon_reconnect_user_stream(gpointer data)
 	md = ic->proto_data;
 	md->user_stream_reconnect_source = 0;
 	md->user_stream_received_data = FALSE;
+
+	/* A stale callback must never create a second user stream. */
+	if (md->user_stream_request != NULL) {
+		return FALSE;
+	}
+
 	mastodon_log(ic, "Reconnecting user stream");
 	mastodon_open_user_stream(ic);
 	return FALSE;
@@ -1398,6 +1404,12 @@ static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
 	url_t url;
 	struct http_request *redirected_req;
 
+	/* A redirect response can invoke its callback more than once. Only the
+	 * currently-owned user request may create its replacement. */
+	if (req != md->user_stream_request) {
+		return FALSE;
+	}
+
 	if (req->status_code != 301 && req->status_code != 302 &&
 	    req->status_code != 307 && req->status_code != 308) {
 		return FALSE;
@@ -1424,6 +1436,7 @@ static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
 	mastodon_log(ic, "Following user streaming redirect to %s", location);
 	redirected_req = mastodon_http_stream_request(ic, location, mastodon_http_stream_user,
 	                                              ic, NULL, 0);
+	md->user_stream_request = redirected_req;
 	g_free(location);
 	mastodon_stream(ic, redirected_req);
 	return redirected_req != NULL;
@@ -1437,6 +1450,15 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 	char *nl;
 
 	if (!g_slist_find(mastodon_connections, ic)) {
+		return;
+	}
+
+	/* Ignore late callbacks from a superseded user stream. They must not
+	 * schedule another timer or create another redirected connection. */
+	if (subscription == MT_HOME && req != md->user_stream_request) {
+		if (req->flags & HTTPC_EOF) {
+			md->streams = g_slist_remove(md->streams, req);
+		}
 		return;
 	}
 
@@ -1458,6 +1480,7 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 
 		md->streams = g_slist_remove(md->streams, req);
 		if (subscription == MT_HOME) {
+			md->user_stream_request = NULL;
 			mastodon_log(ic, "User stream closed (%s)", req->status_string);
 			mastodon_schedule_user_stream_reconnect(ic, established);
 		} else {
@@ -1586,8 +1609,16 @@ void mastodon_stream(struct im_connection *ic, struct http_request *req)
  */
 void mastodon_open_user_stream(struct im_connection *ic)
 {
-	struct http_request *req = mastodon_http_stream_request(ic, MASTODON_STREAMING_USER_URL,
-						                mastodon_http_stream_user, ic, NULL, 0);
+	struct mastodon_data *md = ic->proto_data;
+	struct http_request *req;
+
+	if (md->user_stream_request != NULL) {
+		return;
+	}
+
+	req = mastodon_http_stream_request(ic, MASTODON_STREAMING_USER_URL,
+	                                  mastodon_http_stream_user, ic, NULL, 0);
+	md->user_stream_request = req;
 	mastodon_stream(ic, req);
 }
 
