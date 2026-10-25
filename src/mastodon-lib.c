@@ -37,6 +37,9 @@
 #include "misc.h"
 #include "base64.h"
 #include "mastodon-lib.h"
+
+#define MASTODON_STREAM_WATCHDOG_INTERVAL 30
+#define MASTODON_STREAM_STALE_SECONDS 90
 #include "oauth2.h"
 #include "json.h"
 #include "json_util.h"
@@ -1394,10 +1397,16 @@ static void mastodon_schedule_user_stream_reconnect(struct im_connection *ic, gb
 		delay = md->user_stream_reconnect_delay;
 	}
 
-	// mastodon_log(ic, "User stream disconnected; reconnecting in %u second%s",
-	//              delay, delay == 1 ? "" : "s");
+	if (!established) {
+		mastodon_log(ic, "User stream opening failed; retrying in %u second%s",
+		             delay, delay == 1 ? "" : "s");
+	}
+
 	md->user_stream_reconnect_source =
 	        b_timeout_add(delay * 1000, mastodon_reconnect_user_stream, ic);
+	if (md->user_stream_reconnect_source == 0) {
+		imcb_error(ic, "Unable to schedule user stream reconnect timer");
+	}
 }
 
 /* Finish a failed user-stream opening attempt without taking the account
@@ -1414,6 +1423,65 @@ static void mastodon_fail_user_stream_attempt(struct im_connection *ic,
 	}
 	md->user_stream_received_data = FALSE;
 	mastodon_schedule_user_stream_reconnect(ic, FALSE);
+}
+
+static gboolean mastodon_user_stream_watchdog(gpointer data)
+{
+	struct im_connection *ic = data;
+	struct mastodon_data *md;
+	gint64 now;
+	gint64 silent_seconds;
+	struct http_request *stale_req;
+
+	if (!g_slist_find(mastodon_connections, ic)) {
+		return FALSE;
+	}
+
+	md = ic->proto_data;
+	now = g_get_monotonic_time();
+
+	/* The REST account remains usable while the SSE stream is monitored. */
+	ic->flags |= OPT_PONGED;
+
+	if (md->user_stream_request == NULL) {
+		if (md->user_stream_reconnect_source == 0) {
+			md->user_stream_watchdog_recovery = TRUE;
+			md->user_stream_watchdog_recoveries++;
+			mastodon_log(ic,
+			             "User stream watchdog found no active stream or reconnect timer; scheduling recovery #%u",
+			             md->user_stream_watchdog_recoveries);
+			mastodon_schedule_user_stream_reconnect(ic, FALSE);
+		}
+		return TRUE;
+	}
+
+	if (md->user_stream_last_activity == 0) {
+		md->user_stream_last_activity = now;
+		return TRUE;
+	}
+
+	silent_seconds = (now - md->user_stream_last_activity) / G_USEC_PER_SEC;
+	if (silent_seconds < MASTODON_STREAM_STALE_SECONDS) {
+		return TRUE;
+	}
+
+	stale_req = md->user_stream_request;
+	md->user_stream_request = NULL;
+	md->streams = g_slist_remove(md->streams, stale_req);
+	md->user_stream_received_data = FALSE;
+	md->user_stream_watchdog_recovery = TRUE;
+	md->user_stream_watchdog_recoveries++;
+
+	mastodon_log(ic,
+	             "User stream watchdog detected %" G_GINT64_FORMAT
+	             " seconds without activity (status=%d, flags=0x%x); closing stale stream and scheduling recovery #%u",
+	             silent_seconds, stale_req->status_code, stale_req->flags,
+	             md->user_stream_watchdog_recoveries);
+
+	/* Clear ownership before closing so any resulting callback is stale. */
+	http_close(stale_req);
+	mastodon_schedule_user_stream_reconnect(ic, FALSE);
+	return TRUE;
 }
 
 static gboolean mastodon_stream_follow_user_redirect(struct http_request *req)
@@ -1492,6 +1560,10 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 		return;
 	}
 
+	if (subscription == MT_HOME) {
+		md->user_stream_last_activity = g_get_monotonic_time();
+	}
+
 	/* Mastodon may move the user stream to a dedicated streaming host. */
 	if (subscription == MT_HOME && mastodon_stream_follow_user_redirect(req)) {
 		return;
@@ -1503,6 +1575,12 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 	/* A successful SSE response with body data is an established stream. */
 	if (subscription == MT_HOME && req->status_code == 200 && req->reply_body) {
 		md->user_stream_received_data = TRUE;
+		if (md->user_stream_watchdog_recovery) {
+			md->user_stream_watchdog_recovery = FALSE;
+			mastodon_log(ic,
+			             "User stream watchdog recovery #%u succeeded; stream activity resumed",
+			             md->user_stream_watchdog_recoveries);
+		}
 	}
 
 	if (req->flags & HTTPC_EOF) {
@@ -1646,10 +1724,25 @@ void mastodon_open_user_stream(struct im_connection *ic)
 		return;
 	}
 
+	if (md->user_stream_watchdog_source == 0) {
+		md->user_stream_watchdog_source =
+		        b_timeout_add(MASTODON_STREAM_WATCHDOG_INTERVAL * 1000,
+		                      mastodon_user_stream_watchdog, ic);
+		if (md->user_stream_watchdog_source == 0) {
+			imcb_error(ic, "Unable to start user stream watchdog timer");
+		} else {
+			mastodon_log(ic,
+			             "User stream watchdog started (check every %d seconds, recover after %d seconds without activity)",
+			             MASTODON_STREAM_WATCHDOG_INTERVAL,
+			             MASTODON_STREAM_STALE_SECONDS);
+		}
+	}
+
 	/* This is a new redirect chain, not a continuation of the previous
 	 * stream connection attempt. */
 	md->stream_redirect_count = 0;
 	md->user_stream_received_data = FALSE;
+	md->user_stream_last_activity = g_get_monotonic_time();
 
 	req = mastodon_http_stream_request(ic, MASTODON_STREAMING_USER_URL,
 	                                  mastodon_http_stream_user, ic, NULL, 0);

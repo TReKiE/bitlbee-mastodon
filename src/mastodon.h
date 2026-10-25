@@ -139,6 +139,10 @@ struct mastodon_data {
 	guint user_stream_reconnect_source;
 	guint user_stream_reconnect_delay;
 	gboolean user_stream_received_data;
+	guint user_stream_watchdog_source;
+	gint64 user_stream_last_activity;
+	gboolean user_stream_watchdog_recovery;
+	guint user_stream_watchdog_recoveries;
 	struct groupchat *timeline_gc;
 	guint64 seen_id; /* For deduplication */
 	mastodon_flags_t flags;
