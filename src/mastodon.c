@@ -548,6 +548,11 @@ static void mastodon_logout(struct im_connection *ic)
 			md->user_stream_watchdog_source = 0;
 		}
 
+		if (md->home_poll_source != 0) {
+			b_event_remove(md->home_poll_source);
+			md->home_poll_source = 0;
+		}
+
 		GSList *l;
 		for (l = md->streams; l; l = l->next) {
 			struct http_request *req = l->data;

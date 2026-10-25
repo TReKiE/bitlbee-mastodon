@@ -39,7 +39,8 @@
 #include "mastodon-lib.h"
 
 #define MASTODON_STREAM_WATCHDOG_INTERVAL 30
-#define MASTODON_STREAM_STALE_SECONDS 90
+#define MASTODON_STREAM_STALE_SECONDS 120
+#define MASTODON_HOME_POLL_INTERVAL 15
 #include "oauth2.h"
 #include "json.h"
 #include "json_util.h"
@@ -1299,7 +1300,12 @@ static void mastodon_stream_handle_update(struct im_connection *ic, json_value *
 {
 	struct mastodon_status *ms = mastodon_xt_get_status(parsed, ic);
 	if (ms) {
+		struct mastodon_data *md = ic->proto_data;
+
 		ms->subscription = subscription;
+		if (subscription == MT_HOME && ms->id > md->home_timeline_since_id) {
+			md->home_timeline_since_id = ms->id;
+		}
 		mastodon_status_show(ic, ms);
 		ms_free(ms);
 	}
@@ -1345,6 +1351,158 @@ static void mastodon_stream_handle_event(struct im_connection *ic, mastodon_evt_
 static void mastodon_http_stream_user(struct http_request *req);
 void mastodon_stream(struct im_connection *ic, struct http_request *req);
 void mastodon_open_user_stream(struct im_connection *ic);
+
+static gboolean mastodon_poll_home_timeline(gpointer data);
+
+static void mastodon_stop_home_polling(struct im_connection *ic)
+{
+	struct mastodon_data *md = ic->proto_data;
+
+	if (!md->home_poll_active) {
+		return;
+	}
+
+	md->home_poll_active = FALSE;
+	if (md->home_poll_source != 0) {
+		b_event_remove(md->home_poll_source);
+		md->home_poll_source = 0;
+	}
+	mastodon_log(ic,
+	             "User stream activity resumed; REST home-timeline fallback stopped after %u poll%s",
+	             md->home_poll_count, md->home_poll_count == 1 ? "" : "s");
+}
+
+static void mastodon_http_home_poll(struct http_request *req)
+{
+	struct im_connection *ic = req->data;
+	struct mastodon_data *md;
+	json_value *parsed;
+	guint64 floor_id, max_id;
+	int shown = 0;
+	int i;
+
+	if (!g_slist_find(mastodon_connections, ic)) {
+		return;
+	}
+
+	md = ic->proto_data;
+	md->home_poll_inflight = FALSE;
+	ic->flags |= OPT_PONGED;
+
+	if (req->status_code != 200) {
+		mastodon_log(ic, "REST home-timeline fallback poll failed: HTTP %d %s",
+		             req->status_code, req->status_string ? req->status_string : "Unknown status");
+		return;
+	}
+
+	parsed = json_parse(req->reply_body, req->body_size);
+	if (!parsed || parsed->type != json_array) {
+		mastodon_log(ic, "REST home-timeline fallback returned invalid JSON");
+		if (parsed) {
+			json_value_free(parsed);
+		}
+		return;
+	}
+
+	floor_id = md->home_timeline_since_id;
+	max_id = floor_id;
+
+	/* Mastodon returns newest first. Display qualifying statuses oldest first. */
+	for (i = parsed->u.array.length - 1; i >= 0; i--) {
+		struct mastodon_status *ms = mastodon_xt_get_status(parsed->u.array.values[i], ic);
+
+		if (!ms) {
+			continue;
+		}
+		if (ms->id > max_id) {
+			max_id = ms->id;
+		}
+		if (ms->id > floor_id) {
+			ms->subscription = MT_HOME;
+			mastodon_status_show(ic, ms);
+			shown++;
+		}
+		ms_free(ms);
+	}
+
+	md->home_timeline_since_id = max_id;
+	if (shown > 0) {
+		mastodon_log(ic,
+		             "REST home-timeline fallback delivered %d new status%s (newest ID %" G_GUINT64_FORMAT ")",
+		             shown, shown == 1 ? "" : "es", max_id);
+	}
+	json_value_free(parsed);
+}
+
+static gboolean mastodon_poll_home_timeline(gpointer data)
+{
+	struct im_connection *ic = data;
+	struct mastodon_data *md;
+	struct http_request *req;
+	char *since_id = NULL;
+	char *args[4];
+	int args_len = 0;
+
+	if (!g_slist_find(mastodon_connections, ic)) {
+		return FALSE;
+	}
+
+	md = ic->proto_data;
+	if (!md->home_poll_active) {
+		md->home_poll_source = 0;
+		return FALSE;
+	}
+
+	ic->flags |= OPT_PONGED;
+	if (md->home_poll_inflight) {
+		mastodon_log(ic, "Skipping REST home-timeline fallback poll because the previous poll is still running");
+		return TRUE;
+	}
+
+	args[args_len++] = "limit";
+	args[args_len++] = "40";
+	if (md->home_timeline_since_id != 0) {
+		since_id = g_strdup_printf("%" G_GUINT64_FORMAT, md->home_timeline_since_id);
+		args[args_len++] = "since_id";
+		args[args_len++] = since_id;
+	}
+
+	req = mastodon_http(ic, MASTODON_HOME_TIMELINE_URL, mastodon_http_home_poll,
+	                    ic, HTTP_GET, args, args_len);
+	g_free(since_id);
+	if (!req) {
+		mastodon_log(ic, "Unable to create REST home-timeline fallback request");
+		return TRUE;
+	}
+
+	md->home_poll_inflight = TRUE;
+	md->home_poll_count++;
+	return TRUE;
+}
+
+static void mastodon_start_home_polling(struct im_connection *ic)
+{
+	struct mastodon_data *md = ic->proto_data;
+
+	if (md->home_poll_active) {
+		return;
+	}
+
+	md->home_poll_active = TRUE;
+	md->home_poll_count = 0;
+	mastodon_log(ic,
+	             "User streaming is unavailable; starting REST home-timeline fallback every %d seconds from status ID %" G_GUINT64_FORMAT,
+	             MASTODON_HOME_POLL_INTERVAL, md->home_timeline_since_id);
+
+	/* Poll immediately, then continue at the configured interval. */
+	mastodon_poll_home_timeline(ic);
+	md->home_poll_source =
+	        b_timeout_add(MASTODON_HOME_POLL_INTERVAL * 1000,
+	                      mastodon_poll_home_timeline, ic);
+	if (md->home_poll_source == 0) {
+		imcb_error(ic, "Unable to start REST home-timeline fallback timer");
+	}
+}
 
 static gboolean mastodon_reconnect_user_stream(gpointer data)
 {
@@ -1400,6 +1558,7 @@ static void mastodon_schedule_user_stream_reconnect(struct im_connection *ic, gb
 	if (!established) {
 		mastodon_log(ic, "User stream opening failed; retrying in %u second%s",
 		             delay, delay == 1 ? "" : "s");
+		mastodon_start_home_polling(ic);
 	}
 
 	md->user_stream_reconnect_source =
@@ -1575,6 +1734,7 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 	/* A successful SSE response with body data is an established stream. */
 	if (subscription == MT_HOME && req->status_code == 200 && req->reply_body) {
 		md->user_stream_received_data = TRUE;
+		mastodon_stop_home_polling(ic);
 		if (md->user_stream_watchdog_recovery) {
 			md->user_stream_watchdog_recovery = FALSE;
 			mastodon_log(ic,
@@ -1589,7 +1749,11 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 		md->streams = g_slist_remove(md->streams, req);
 		if (subscription == MT_HOME) {
 			md->user_stream_request = NULL;
-			//mastodon_log(ic, "User stream closed (%s)", req->status_string);
+			if (req->status_code != 200) {
+				mastodon_log(ic, "User stream request failed: HTTP %d %s",
+				             req->status_code,
+				             req->status_string ? req->status_string : "Unknown status");
+			}
 			mastodon_schedule_user_stream_reconnect(ic, established);
 		} else {
 			//mastodon_log(ic, "Stream closed (%s)", req->status_string);
@@ -1894,7 +2058,12 @@ static void mastodon_http_timeline(struct http_request *req, mastodon_timeline_t
 		json_value *node = parsed->u.array.values[i];
 		struct mastodon_status *ms = mastodon_xt_get_status(node, ic);
 		if (ms) {
+			struct mastodon_data *md = ic->proto_data;
+
 			ms->subscription = subscription;
+			if (subscription == MT_HOME && ms->id > md->home_timeline_since_id) {
+				md->home_timeline_since_id = ms->id;
+			}
 			mastodon_status_show(ic, ms);
 			ms_free(ms);
 		}

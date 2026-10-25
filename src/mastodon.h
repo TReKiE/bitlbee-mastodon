@@ -143,6 +143,11 @@ struct mastodon_data {
 	gint64 user_stream_last_activity;
 	gboolean user_stream_watchdog_recovery;
 	guint user_stream_watchdog_recoveries;
+	guint home_poll_source;
+	gboolean home_poll_active;
+	gboolean home_poll_inflight;
+	guint home_poll_count;
+	guint64 home_timeline_since_id;
 	struct groupchat *timeline_gc;
 	guint64 seen_id; /* For deduplication */
 	mastodon_flags_t flags;
