@@ -1602,6 +1602,33 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 	/* The REST account remains usable while the SSE stream is monitored. */
 	ic->flags |= OPT_PONGED;
 
+	/*
+	 * user_stream_request may outlive the HTTP client's ownership of the
+	 * request. A non-NULL pointer is authoritative only while it is still in
+	 * md->streams. Treat an untracked pointer as opaque: never dereference or
+	 * externally close it.
+	 */
+	if (md->user_stream_request != NULL &&
+	    !g_slist_find(md->streams, md->user_stream_request)) {
+		struct http_request *orphaned_req = md->user_stream_request;
+
+		md->user_stream_request = NULL;
+		md->user_stream_received_data = FALSE;
+		md->user_stream_watchdog_recovery = TRUE;
+		md->user_stream_watchdog_recoveries++;
+
+		mastodon_log(ic,
+		             "User stream watchdog found an untracked request pointer %p; "
+		             "clearing stale ownership and scheduling recovery #%u",
+		             (void *) orphaned_req,
+		             md->user_stream_watchdog_recoveries);
+
+		if (md->user_stream_reconnect_source == 0) {
+			mastodon_schedule_user_stream_reconnect(ic, FALSE);
+		}
+		return TRUE;
+	}
+
 	if (md->user_stream_request == NULL) {
 		if (md->user_stream_reconnect_source == 0) {
 			md->user_stream_watchdog_recovery = TRUE;
@@ -1625,35 +1652,28 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 	}
 
 	stale_req = md->user_stream_request;
-
-	/*
-	* Relinquish ownership before scheduling a replacement. Do not call
-	* http_close() here: a stalled BitlBee HTTP request may retain a stale
-	* event-source ID, and externally closing it can cause b_event_remove()
-	* to remove an already-destroyed GLib source.
-	*
-	* If the old request eventually invokes its callback, the existing
-	* ownership check will recognize it as superseded and ignore it.
-	*/
-	md->user_stream_request = NULL;
-	md->streams = g_slist_remove(md->streams, stale_req);
-	md->user_stream_received_data = FALSE;
-	md->user_stream_watchdog_recovery = TRUE;
 	md->user_stream_watchdog_recoveries++;
 
+	/*
+	 * The HTTP client may already have released the request. Log only the
+	 * opaque pointer value and list membership; do not dereference stale_req
+	 * and do not call http_close().
+	*/
 	mastodon_log(ic,
 				"User stream watchdog detected %" G_GINT64_FORMAT
-				" seconds without activity: request=%p status=%d "
-				"flags=0x%x body_size=%d tracked_streams=%u; "
-				"abandoning stale stream and scheduling recovery #%u",
+	             " seconds without activity: request=%p tracked=%s "
+	             "tracked_streams=%u; abandoning stale stream and "
+	             "scheduling recovery #%u",
 				silent_seconds,
 				(void *) stale_req,
-				stale_req->status_code,
-				stale_req->flags,
-				stale_req->body_size,
+	             g_slist_find(md->streams, stale_req) ? "yes" : "no",
 				g_slist_length(md->streams),
 				md->user_stream_watchdog_recoveries);
 
+	/*
+	 * Clear ownership before scheduling a replacement. A later callback from
+	 * the old request will be ignored by the superseded-request check.
+	 */
 	md->user_stream_request = NULL;
 	md->streams = g_slist_remove(md->streams, stale_req);
 	md->user_stream_received_data = FALSE;
