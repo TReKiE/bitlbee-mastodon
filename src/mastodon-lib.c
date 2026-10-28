@@ -1625,6 +1625,16 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 	}
 
 	stale_req = md->user_stream_request;
+
+	/*
+	* Relinquish ownership before scheduling a replacement. Do not call
+	* http_close() here: a stalled BitlBee HTTP request may retain a stale
+	* event-source ID, and externally closing it can cause b_event_remove()
+	* to remove an already-destroyed GLib source.
+	*
+	* If the old request eventually invokes its callback, the existing
+	* ownership check will recognize it as superseded and ignore it.
+	*/
 	md->user_stream_request = NULL;
 	md->streams = g_slist_remove(md->streams, stale_req);
 	md->user_stream_received_data = FALSE;
@@ -1632,13 +1642,23 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 	md->user_stream_watchdog_recoveries++;
 
 	mastodon_log(ic,
-	             "User stream watchdog detected %" G_GINT64_FORMAT
-	             " seconds without activity (status=%d, flags=0x%x); closing stale stream and scheduling recovery #%u",
-	             silent_seconds, stale_req->status_code, stale_req->flags,
-	             md->user_stream_watchdog_recoveries);
+				"User stream watchdog detected %" G_GINT64_FORMAT
+				" seconds without activity: request=%p status=%d "
+				"flags=0x%x body_size=%d tracked_streams=%u; "
+				"abandoning stale stream and scheduling recovery #%u",
+				silent_seconds,
+				(void *) stale_req,
+				stale_req->status_code,
+				stale_req->flags,
+				stale_req->body_size,
+				g_slist_length(md->streams),
+				md->user_stream_watchdog_recoveries);
 
-	/* Clear ownership before closing so any resulting callback is stale. */
-	http_close(stale_req);
+	md->user_stream_request = NULL;
+	md->streams = g_slist_remove(md->streams, stale_req);
+	md->user_stream_received_data = FALSE;
+	md->user_stream_watchdog_recovery = TRUE;
+
 	mastodon_schedule_user_stream_reconnect(ic, FALSE);
 	return TRUE;
 }
