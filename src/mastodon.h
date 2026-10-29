@@ -143,6 +143,10 @@ struct mastodon_data {
 	gint64 user_stream_last_activity;
 	gboolean user_stream_watchdog_recovery;
 	guint user_stream_watchdog_recoveries;
+	guint user_stream_silent_failures;
+	gboolean user_stream_suspended;
+	gboolean user_stream_probe_active;
+	gint64 user_stream_retry_after;
 	guint home_poll_source;
 	gboolean home_poll_active;
 	gboolean home_poll_inflight;

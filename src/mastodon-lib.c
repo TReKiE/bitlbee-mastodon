@@ -41,6 +41,8 @@
 #define MASTODON_STREAM_WATCHDOG_INTERVAL 30
 #define MASTODON_STREAM_STALE_SECONDS 120
 #define MASTODON_HOME_POLL_INTERVAL 15
+#define MASTODON_STREAM_SILENT_FAILURE_LIMIT 3
+#define MASTODON_STREAM_CIRCUIT_BREAKER_SECONDS 900
 #include "oauth2.h"
 #include "json.h"
 #include "json_util.h"
@@ -1331,9 +1333,28 @@ static void mastodon_stream_handle_delete(struct im_connection *ic, json_value *
 	}
 }
 
+static void mastodon_stop_home_polling(struct im_connection *ic);
+
 static void mastodon_stream_handle_event(struct im_connection *ic, mastodon_evt_flags_t evt_type,
 					 json_value *parsed, mastodon_timeline_type_t subscription)
 {
+	struct mastodon_data *md = ic->proto_data;
+
+	/* Only a complete SSE event proves the stream healthy. The initial
+	 * comment/greeting is not sufficient to close the circuit breaker. */
+	md->user_stream_silent_failures = 0;
+	md->user_stream_suspended = FALSE;
+	md->user_stream_probe_active = FALSE;
+	md->user_stream_retry_after = 0;
+	md->user_stream_reconnect_delay = 0;
+	mastodon_stop_home_polling(ic);
+	if (md->user_stream_watchdog_recovery) {
+		md->user_stream_watchdog_recovery = FALSE;
+		mastodon_log(ic,
+		             "User stream recovery #%u confirmed by a complete SSE event",
+		             md->user_stream_watchdog_recoveries);
+	}
+
 	if (evt_type == MASTODON_EVT_UPDATE) {
 		mastodon_stream_handle_update(ic, parsed, subscription);
 	} else if (evt_type == MASTODON_EVT_NOTIFICATION) {
@@ -1536,6 +1557,17 @@ static void mastodon_schedule_user_stream_reconnect(struct im_connection *ic, gb
 		return;
 	}
 
+	if (md->user_stream_suspended) {
+		md->user_stream_probe_active = FALSE;
+		md->user_stream_retry_after = g_get_monotonic_time() +
+		        MASTODON_STREAM_CIRCUIT_BREAKER_SECONDS * G_USEC_PER_SEC;
+		mastodon_start_home_polling(ic);
+		mastodon_log(ic,
+		             "User stream circuit breaker remains open; next SSE probe in %d minutes",
+		             MASTODON_STREAM_CIRCUIT_BREAKER_SECONDS / 60);
+		return;
+	}
+
 	/* The account itself is still usable while only the SSE stream is being
 	 * retried. Keep BitlBee's watchdog satisfied during bounded backoff. */
 	ic->flags |= OPT_PONGED;
@@ -1598,16 +1630,28 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 
 	md = ic->proto_data;
 	now = g_get_monotonic_time();
-
-	/* The REST account remains usable while the SSE stream is monitored. */
 	ic->flags |= OPT_PONGED;
 
-	/*
-	 * user_stream_request may outlive the HTTP client's ownership of the
-	 * request. A non-NULL pointer is authoritative only while it is still in
-	 * md->streams. Treat an untracked pointer as opaque: never dereference or
-	 * externally close it.
-	 */
+	/* While the circuit is open, REST polling remains authoritative. Allow
+	 * just one SSE probe after the cooldown expires. */
+	if (md->user_stream_suspended && md->user_stream_request == NULL) {
+		if (md->user_stream_probe_active) {
+			return TRUE;
+		}
+		if (now < md->user_stream_retry_after) {
+			return TRUE;
+		}
+
+		md->user_stream_probe_active = TRUE;
+		md->user_stream_last_activity = now;
+		mastodon_log(ic,
+		             "User stream circuit-breaker cooldown expired; attempting one SSE probe");
+		mastodon_open_user_stream(ic);
+		return TRUE;
+	}
+
+	/* A non-NULL ownership pointer is meaningful only while it remains in
+	 * the plugin's stream list. Never dereference or close an untracked one. */
 	if (md->user_stream_request != NULL &&
 	    !g_slist_find(md->streams, md->user_stream_request)) {
 		struct http_request *orphaned_req = md->user_stream_request;
@@ -1616,20 +1660,25 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 		md->user_stream_received_data = FALSE;
 		md->user_stream_watchdog_recovery = TRUE;
 		md->user_stream_watchdog_recoveries++;
-
 		mastodon_log(ic,
-		             "User stream watchdog found an untracked request pointer %p; "
-		             "clearing stale ownership and scheduling recovery #%u",
-		             (void *) orphaned_req,
-		             md->user_stream_watchdog_recoveries);
+		             "User stream watchdog found an untracked request pointer %p; clearing stale ownership",
+		             (void *) orphaned_req);
 
-		if (md->user_stream_reconnect_source == 0) {
+		if (md->user_stream_suspended) {
+			md->user_stream_probe_active = FALSE;
+			md->user_stream_retry_after = now +
+			        MASTODON_STREAM_CIRCUIT_BREAKER_SECONDS * G_USEC_PER_SEC;
+			mastodon_start_home_polling(ic);
+		} else if (md->user_stream_reconnect_source == 0) {
 			mastodon_schedule_user_stream_reconnect(ic, FALSE);
 		}
 		return TRUE;
 	}
 
 	if (md->user_stream_request == NULL) {
+		if (md->user_stream_suspended) {
+			return TRUE;
+		}
 		if (md->user_stream_reconnect_source == 0) {
 			md->user_stream_watchdog_recovery = TRUE;
 			md->user_stream_watchdog_recoveries++;
@@ -1646,38 +1695,48 @@ static gboolean mastodon_user_stream_watchdog(gpointer data)
 		return TRUE;
 	}
 
-	silent_seconds = (now - md->user_stream_last_activity) / G_USEC_PER_SEC;
+	silent_seconds =
+	        (now - md->user_stream_last_activity) / G_USEC_PER_SEC;
 	if (silent_seconds < MASTODON_STREAM_STALE_SECONDS) {
 		return TRUE;
 	}
 
 	stale_req = md->user_stream_request;
 	md->user_stream_watchdog_recoveries++;
+	md->user_stream_silent_failures++;
 
-	/*
-	 * The HTTP client may already have released the request. Log only the
-	 * opaque pointer value and list membership; do not dereference stale_req
-	 * and do not call http_close().
-	*/
 	mastodon_log(ic,
-				"User stream watchdog detected %" G_GINT64_FORMAT
-	             " seconds without activity: request=%p tracked=%s "
-	             "tracked_streams=%u; abandoning stale stream and "
-	             "scheduling recovery #%u",
-				silent_seconds,
-				(void *) stale_req,
+	             "User stream watchdog detected %" G_GINT64_FORMAT
+	             " seconds without activity: request=%p tracked=%s tracked_streams=%u; silent failure %u/%u",
+	             silent_seconds, (void *) stale_req,
 	             g_slist_find(md->streams, stale_req) ? "yes" : "no",
-				g_slist_length(md->streams),
-				md->user_stream_watchdog_recoveries);
+	             g_slist_length(md->streams),
+	             md->user_stream_silent_failures,
+	             MASTODON_STREAM_SILENT_FAILURE_LIMIT);
 
-	/*
-	 * Clear ownership before scheduling a replacement. A later callback from
-	 * the old request will be ignored by the superseded-request check.
-	 */
+	/* Treat stale_req as opaque. Do not dereference it or call http_close(). */
 	md->user_stream_request = NULL;
 	md->streams = g_slist_remove(md->streams, stale_req);
 	md->user_stream_received_data = FALSE;
 	md->user_stream_watchdog_recovery = TRUE;
+
+	if (md->user_stream_silent_failures >=
+	    MASTODON_STREAM_SILENT_FAILURE_LIMIT) {
+		md->user_stream_suspended = TRUE;
+		md->user_stream_probe_active = FALSE;
+		md->user_stream_retry_after = now +
+		        MASTODON_STREAM_CIRCUIT_BREAKER_SECONDS * G_USEC_PER_SEC;
+		if (md->user_stream_reconnect_source != 0) {
+			b_event_remove(md->user_stream_reconnect_source);
+			md->user_stream_reconnect_source = 0;
+		}
+		mastodon_start_home_polling(ic);
+		mastodon_log(ic,
+		             "User stream circuit breaker opened after %u silent failures; suspending SSE for %d minutes while REST fallback continues",
+		             md->user_stream_silent_failures,
+		             MASTODON_STREAM_CIRCUIT_BREAKER_SECONDS / 60);
+		return TRUE;
+	}
 
 	mastodon_schedule_user_stream_reconnect(ic, FALSE);
 	return TRUE;
@@ -1774,13 +1833,6 @@ static void mastodon_http_stream(struct http_request *req, mastodon_timeline_typ
 	/* A successful SSE response with body data is an established stream. */
 	if (subscription == MT_HOME && req->status_code == 200 && req->reply_body) {
 		md->user_stream_received_data = TRUE;
-		mastodon_stop_home_polling(ic);
-		if (md->user_stream_watchdog_recovery) {
-			md->user_stream_watchdog_recovery = FALSE;
-			mastodon_log(ic,
-			             "User stream watchdog recovery #%u succeeded; stream activity resumed",
-			             md->user_stream_watchdog_recoveries);
-		}
 	}
 
 	if (req->flags & HTTPC_EOF) {
@@ -1925,6 +1977,9 @@ void mastodon_open_user_stream(struct im_connection *ic)
 	struct http_request *req;
 
 	if (md->user_stream_request != NULL) {
+		return;
+	}
+	if (md->user_stream_suspended && !md->user_stream_probe_active) {
 		return;
 	}
 
